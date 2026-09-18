@@ -10,8 +10,11 @@ from __future__ import annotations
 import logging
 import time
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
+from app import verifier
 from app.llm_interpreter import interpret_notes
 from app.optimizer import solve
 from app.schemas import (
@@ -35,6 +38,30 @@ app = FastAPI(
 )
 
 
+@app.exception_handler(RequestValidationError)
+async def request_validation_error(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    details = [
+        {
+            "loc": error.get("loc", ()),
+            "msg": error.get("msg", "Invalid request"),
+            "type": error.get("type", "validation_error"),
+        }
+        for error in exc.errors()
+    ]
+    return JSONResponse(status_code=400, content={"detail": details})
+
+
+@app.exception_handler(RuntimeError)
+async def runtime_error(request: Request, exc: RuntimeError) -> JSONResponse:
+    logger.error("Request failed with controlled runtime error: %s", type(exc).__name__)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "The optimization service could not complete the request."},
+    )
+
+
 # ── Utility: totals computed once ─────────────────────────────────────────
 
 def _compute_totals(
@@ -44,10 +71,11 @@ def _compute_totals(
     total_grid = 0.0
     total_cost = 0.0
     peak_grid = 0.0
+    hours_by_id = {hour.hour: hour for hour in hours}
     for entry in plan:
         g = entry.grid_kwh
         total_grid += g
-        total_cost += g * hours[entry.hour].tariff_bdt_per_kwh
+        total_cost += g * hours_by_id[entry.hour].tariff_bdt_per_kwh
         if g > peak_grid:
             peak_grid = g
     return round(total_grid, 2), round(total_cost, 2), round(peak_grid, 2)
@@ -82,7 +110,32 @@ async def optimize_energy(request: OptimizeRequest) -> OptimizeResponse:
     # 2. Solve MILP
     hourly_plan = solve(request.hours, request.battery, directives)
 
-    # 3. Compute totals exactly once from the final plan
+    # 3. Replay the final schedule before computing its response totals.
+    provisional_response = OptimizeResponse(
+        scenario_id=request.scenario_id,
+        directive_interpretation=directives,
+        hourly_plan=hourly_plan,
+        total_grid_kwh=0.0,
+        total_cost_bdt=0.0,
+        peak_grid_kwh=0.0,
+        plan_summary="",
+    )
+    verified, violations = verifier.verify_schedule_compliance(
+        provisional_response,
+        request.hours,
+        request.battery,
+        directives,
+        check_totals=False,
+    )
+    if not verified:
+        logger.error(
+            "scenario=%s schedule verification failed with %d violation(s)",
+            request.scenario_id,
+            len(violations),
+        )
+        raise RuntimeError("Final schedule verification failed")
+
+    # 4. Compute totals exactly once from the verified final plan.
     total_grid, total_cost, peak_grid = _compute_totals(
         hourly_plan, request.hours
     )

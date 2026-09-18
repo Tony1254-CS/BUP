@@ -66,7 +66,10 @@ def _apply_directives(
     Return per-hour effective parameters after applying directives.
     Returns (eff_solar, min_reserve, max_charge, max_discharge, max_grid).
     """
-    eff_solar = [h.solar_kwh for h in hours]
+    hours_by_id = {hour.hour: hour for hour in hours}
+    if set(hours_by_id) != set(range(N)):
+        raise ValueError("hours must contain each hour from 0 through 23 exactly once")
+    eff_solar = [hours_by_id[h].solar_kwh for h in range(N)]
     min_reserve = [battery.minimum_energy_kwh] * N
     max_charge = [battery.max_charge_kwh_per_hour] * N
     max_discharge = [battery.max_discharge_kwh_per_hour] * N
@@ -82,7 +85,7 @@ def _apply_directives(
             factor = float(adj.get("factor", 1.0))
             for h in affected:
                 if 0 <= h < N:
-                    eff_solar[h] = hours[h].solar_kwh * factor
+                    eff_solar[h] = min(eff_solar[h], hours_by_id[h].solar_kwh * factor)
 
         elif d.directive_type == "minimum_battery_reserve":
             val = float(adj.get("minimum_energy_kwh", battery.minimum_energy_kwh))
@@ -125,8 +128,11 @@ def solve(
 
     capacity = battery.capacity_kwh
     init_e = battery.initial_energy_kwh
-    demand = [h.demand_kwh for h in hours]
-    tariff = [h.tariff_bdt_per_kwh for h in hours]
+    hours_by_id = {hour.hour: hour for hour in hours}
+    if set(hours_by_id) != set(range(N)):
+        raise ValueError("hours must contain each hour from 0 through 23 exactly once")
+    demand = [hours_by_id[h].demand_kwh for h in range(N)]
+    tariff = [hours_by_id[h].tariff_bdt_per_kwh for h in range(N)]
 
     # ── Objective ─────────────────────────────────────────────────────────
     c_obj = np.zeros(N_VAR)
@@ -232,11 +238,11 @@ def solve(
     # ── Extract hourly plan ───────────────────────────────────────────────
     plan: list[HourlyPlanEntry] = []
     for h in range(N):
-        g_val = round(float(x[_vi(h, G)]), 2)
-        s_val = round(float(x[_vi(h, S)]), 2)
-        c_val = round(float(x[_vi(h, C)]), 2)
-        d_val = round(float(x[_vi(h, D)]), 2)
-        e_val = round(float(x[_vi(h, E)]), 2)
+        g_val = round(float(x[_vi(h, G)]), 6)
+        s_val = round(float(x[_vi(h, S)]), 6)
+        c_val = round(float(x[_vi(h, C)]), 6)
+        d_val = round(float(x[_vi(h, D)]), 6)
+        e_val = round(float(x[_vi(h, E)]), 6)
 
         # Clean near-zero noise
         if g_val < 1e-6:

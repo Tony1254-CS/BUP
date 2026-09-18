@@ -117,6 +117,26 @@ class TestInvalidDirectives:
         with pytest.raises(DirectiveValidationError, match="\\[0, 1\\]"):
             validate_directive(d, BAT)
 
+    def test_solar_factor_must_be_finite(self):
+        d = {"applies": True, "directive_type": "solar_reduction",
+             "structured_adjustment": {"hours": [10], "factor": float("inf")},
+             "explanation": "x"}
+        with pytest.raises(DirectiveValidationError, match="\\[0, 1\\]"):
+            validate_directive(d, BAT)
+
+    def test_reserve_cannot_exceed_capacity(self):
+        d = {"applies": True, "directive_type": "minimum_battery_reserve",
+             "structured_adjustment": {"hours": [10], "minimum_energy_kwh": 501},
+             "explanation": "x"}
+        with pytest.raises(DirectiveValidationError, match="capacity"):
+            validate_directive(d, BAT)
+
+    def test_boolean_hour_is_rejected(self):
+        d = {"applies": True, "directive_type": "no_charge_window",
+             "structured_adjustment": {"hours": [True]}, "explanation": "x"}
+        with pytest.raises(DirectiveValidationError, match="must be int"):
+            validate_directive(d, BAT)
+
     def test_solar_missing_factor(self):
         d = {"applies": True, "directive_type": "solar_reduction",
              "structured_adjustment": {"hours": [10]}, "explanation": "x"}

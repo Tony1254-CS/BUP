@@ -1,12 +1,19 @@
 import math
 from typing import List, Dict, Any, Tuple
-from app.schemas import HourEntry, BatteryConfig, OptimizeResponse, DirectiveInterpretation
+from app.schemas import (
+    DirectiveInterpretation,
+    HourInput,
+    BatteryInput,
+    OptimizeResponse,
+)
 
 def verify_schedule_compliance(
     response: OptimizeResponse,
-    hours: List[HourEntry],
-    battery: BatteryConfig,
-    directives: List[DirectiveInterpretation]
+    hours: List[HourInput],
+    battery: BatteryInput,
+    directives: List[DirectiveInterpretation],
+    *,
+    check_totals: bool = True,
 ) -> Tuple[bool, List[str]]:
     """
     Simulates the official organizer judge harness.
@@ -22,11 +29,17 @@ def verify_schedule_compliance(
         return False, violations
 
     plan_by_hour = {p.hour: p for p in response.hourly_plan}
-    if len(plan_by_hour) != 24:
+    if set(plan_by_hour) != set(range(24)):
         violations.append("hourly_plan contains duplicate or missing hours")
+        return False, violations
+
+    hours_by_id = {hour.hour: hour for hour in hours}
+    if set(hours_by_id) != set(range(24)):
+        violations.append("hours contains duplicate or missing hours")
+        return False, violations
 
     # 2. Recompute effective parameters from directives
-    effective_solar = [h.solar_kwh for h in hours]
+    effective_solar = [hours_by_id[h].solar_kwh for h in range(24)]
     min_reserve = [battery.minimum_energy_kwh] * 24
     max_charge = [battery.max_charge_kwh_per_hour] * 24
     max_discharge = [battery.max_discharge_kwh_per_hour] * 24
@@ -43,7 +56,7 @@ def verify_schedule_compliance(
             factor = float(adj.get("factor", 1.0))
             for h in aff_hours:
                 if 0 <= h < 24:
-                    effective_solar[h] = hours[h].solar_kwh * factor
+                    effective_solar[h] = min(effective_solar[h], hours_by_id[h].solar_kwh * factor)
         elif dtype == "minimum_battery_reserve":
             res_val = float(adj.get("minimum_energy_kwh", battery.minimum_energy_kwh))
             for h in aff_hours:
@@ -75,8 +88,8 @@ def verify_schedule_compliance(
             violations.append(f"Hour {h} missing in hourly_plan")
             continue
 
-        demand = hours[h].demand_kwh
-        tariff = hours[h].tariff_bdt_per_kwh
+        demand = hours_by_id[h].demand_kwh
+        tariff = hours_by_id[h].tariff_bdt_per_kwh
 
         # Non-negative checks
         if item.grid_kwh < -TOLERANCE or item.solar_used_kwh < -TOLERANCE or item.battery_kwh < -TOLERANCE:
@@ -129,13 +142,16 @@ def verify_schedule_compliance(
     if abs(current_energy - battery.initial_energy_kwh) > TOLERANCE:
         violations.append(f"End-of-day neutrality broken: final={current_energy:.2f} != initial={battery.initial_energy_kwh:.2f}")
 
-    # 5. Totals check
-    if abs(response.total_grid_kwh - recalc_grid) > TOLERANCE:
-        violations.append(f"total_grid_kwh mismatch: reported={response.total_grid_kwh:.2f}, recalculated={recalc_grid:.2f}")
-    if abs(response.total_cost_bdt - recalc_cost) > TOLERANCE:
-        violations.append(f"total_cost_bdt mismatch: reported={response.total_cost_bdt:.2f}, recalculated={recalc_cost:.2f}")
-    if abs(response.peak_grid_kwh - recalc_peak) > TOLERANCE:
-        violations.append(f"peak_grid_kwh mismatch: reported={response.peak_grid_kwh:.2f}, recalculated={recalc_peak:.2f}")
+    # Totals are checked when verifying a completed response. The production
+    # endpoint disables this for its provisional response so totals are
+    # computed only after the schedule itself passes replay.
+    if check_totals:
+        if abs(response.total_grid_kwh - recalc_grid) > TOLERANCE:
+            violations.append(f"total_grid_kwh mismatch: reported={response.total_grid_kwh:.2f}, recalculated={recalc_grid:.2f}")
+        if abs(response.total_cost_bdt - recalc_cost) > TOLERANCE:
+            violations.append(f"total_cost_bdt mismatch: reported={response.total_cost_bdt:.2f}, recalculated={recalc_cost:.2f}")
+        if abs(response.peak_grid_kwh - recalc_peak) > TOLERANCE:
+            violations.append(f"peak_grid_kwh mismatch: reported={response.peak_grid_kwh:.2f}, recalculated={recalc_peak:.2f}")
 
     is_valid = (len(violations) == 0)
     return is_valid, violations

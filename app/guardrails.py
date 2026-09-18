@@ -9,6 +9,7 @@ catch and fall back to no_op for that single note.
 """
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from app.schemas import BatteryInput
@@ -89,11 +90,11 @@ def validate_directive(raw: dict[str, Any], battery: BatteryInput) -> None:
         factor = adj.get("factor")
         if factor is None:
             raise DirectiveValidationError("solar_reduction requires 'factor'")
-        if not isinstance(factor, (int, float)):
+        if isinstance(factor, bool) or not isinstance(factor, (int, float)):
             raise DirectiveValidationError(
                 f"solar_reduction factor must be numeric, got {type(factor).__name__}"
             )
-        if not (0.0 <= float(factor) <= 1.0):
+        if not math.isfinite(float(factor)) or not (0.0 <= float(factor) <= 1.0):
             raise DirectiveValidationError(
                 f"solar_reduction factor must be in [0, 1], got {factor}"
             )
@@ -104,13 +105,17 @@ def validate_directive(raw: dict[str, Any], battery: BatteryInput) -> None:
             raise DirectiveValidationError(
                 "minimum_battery_reserve requires 'minimum_energy_kwh'"
             )
-        if not isinstance(mek, (int, float)):
+        if isinstance(mek, bool) or not isinstance(mek, (int, float)):
             raise DirectiveValidationError(
                 "minimum_energy_kwh must be numeric"
             )
-        if float(mek) < 0:
+        if (
+            not math.isfinite(float(mek))
+            or float(mek) < 0
+            or float(mek) > battery.capacity_kwh
+        ):
             raise DirectiveValidationError(
-                f"minimum_energy_kwh must be >= 0, got {mek}"
+                f"minimum_energy_kwh must be finite, >= 0, and <= battery capacity; got {mek}"
             )
 
     elif dtype == "max_grid_window":
@@ -119,11 +124,11 @@ def validate_directive(raw: dict[str, Any], battery: BatteryInput) -> None:
             raise DirectiveValidationError(
                 "max_grid_window requires 'max_grid_kwh'"
             )
-        if not isinstance(mgk, (int, float)):
+        if isinstance(mgk, bool) or not isinstance(mgk, (int, float)):
             raise DirectiveValidationError("max_grid_kwh must be numeric")
-        if float(mgk) < 0:
+        if not math.isfinite(float(mgk)) or float(mgk) < 0:
             raise DirectiveValidationError(
-                f"max_grid_kwh must be >= 0, got {mgk}"
+                f"max_grid_kwh must be finite and >= 0, got {mgk}"
             )
 
     elif dtype in ("no_charge_window", "no_discharge_window"):
@@ -142,7 +147,7 @@ def _validate_hours(hours: Any, dtype: str) -> None:
 
     prev = -1
     for i, h in enumerate(hours):
-        if not isinstance(h, int):
+        if isinstance(h, bool) or not isinstance(h, int):
             raise DirectiveValidationError(
                 f"{dtype}: hours[{i}] must be int, got {type(h).__name__} ({h!r})"
             )

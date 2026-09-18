@@ -1,6 +1,6 @@
 import json
-from app.schemas import HourEntry, BatteryConfig, DirectiveInterpretation
-from app.optimizer import solve_energy_schedule
+from app.schemas import HourInput, BatteryInput, DirectiveInterpretation
+from app.optimizer import solve
 
 def run_tests():
     with open('sample_cases.json', 'r') as f:
@@ -10,11 +10,13 @@ def run_tests():
     all_passed = True
     for case in pack['cases']:
         cid = case['id']
-        hours = [HourEntry(**h) for h in case['input']['hours']]
-        battery = BatteryConfig(**case['input']['battery'])
+        hours = [HourInput(**h) for h in case['input']['hours']]
+        battery = BatteryInput(**case['input']['battery'])
         expected_dirs = [DirectiveInterpretation(**d) for d in case['expected_output']['directive_interpretation']]
 
-        plan, tot_grid, tot_cost, peak_grid = solve_energy_schedule(hours, battery, expected_dirs)
+        plan = solve(hours, battery, expected_dirs)
+        tot_grid = sum(entry.grid_kwh for entry in plan)
+        tot_cost = sum(entry.grid_kwh * hours[entry.hour].tariff_bdt_per_kwh for entry in plan)
         exp_cost = case['expected_output']['total_cost_bdt']
         exp_grid = case['expected_output']['total_grid_kwh']
 

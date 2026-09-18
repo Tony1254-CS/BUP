@@ -14,8 +14,11 @@ from fastapi.testclient import TestClient
 
 # Force LLM skip for e2e tests
 os.environ["SKIP_LLM"] = "true"
+os.environ["GRIDWISE_TEST_MODE"] = "true"
 
 from app.main import app
+import app.main as main_module
+from app import verifier
 
 client = TestClient(app)
 
@@ -51,7 +54,7 @@ def test_schema_validation_empty_notes():
             "max_discharge_kwh_per_hour": 100,
         },
     })
-    assert resp.status_code == 422  # Pydantic validation error
+    assert resp.status_code == 400  # structurally invalid request
 
 
 def test_schema_validation_missing_field():
@@ -67,7 +70,31 @@ def test_schema_validation_missing_field():
             "max_discharge_kwh_per_hour": 100,
         },
     })
-    assert resp.status_code == 422
+    assert resp.status_code == 400
+
+
+def test_schema_validation_rejects_coerced_hour_type():
+    payload = {
+        "scenario_id": "TEST",
+        "operator_notes": ["test"],
+        "hours": [
+            {
+                "hour": ("0" if i == 0 else i),
+                "demand_kwh": 1,
+                "solar_kwh": 0,
+                "tariff_bdt_per_kwh": 1,
+            }
+            for i in range(24)
+        ],
+        "battery": {
+            "capacity_kwh": 500,
+            "initial_energy_kwh": 250,
+            "minimum_energy_kwh": 50,
+            "max_charge_kwh_per_hour": 100,
+            "max_discharge_kwh_per_hour": 100,
+        },
+    }
+    assert client.post("/optimize-energy", json=payload).status_code == 400
 
 
 @pytest.fixture(params=CASES[:3], ids=[c["id"] for c in CASES[:3]])
@@ -110,3 +137,50 @@ def test_e2e_totals_consistent(case):
     assert abs(body["total_grid_kwh"] - total_grid) < 0.1
     assert abs(body["total_cost_bdt"] - total_cost) < 0.1
     assert abs(body["peak_grid_kwh"] - peak) < 0.1
+
+
+def test_production_endpoint_invokes_schedule_verifier(monkeypatch, case):
+    calls = []
+    original = verifier.verify_schedule_compliance
+
+    def recording_verifier(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(verifier, "verify_schedule_compliance", recording_verifier)
+    resp = client.post("/optimize-energy", json=case["input"])
+
+    assert resp.status_code == 200
+    assert len(calls) == 1
+    assert calls[0][1]["check_totals"] is False
+    assert calls[0][0][0].hourly_plan
+
+
+def test_production_endpoint_rejects_failed_schedule_verification(
+    monkeypatch, case
+):
+    monkeypatch.setattr(
+        verifier,
+        "verify_schedule_compliance",
+        lambda *args, **kwargs: (False, ["synthetic verification failure"]),
+    )
+
+    resp = client.post("/optimize-energy", json=case["input"])
+
+    assert resp.status_code == 500
+    assert resp.json() == {
+        "detail": "The optimization service could not complete the request."
+    }
+
+
+def test_production_endpoint_rejects_failed_llm_interpretation(monkeypatch, case):
+    async def failed_interpreter(*args, **kwargs):
+        raise RuntimeError("synthetic LLM failure")
+
+    monkeypatch.setattr(main_module, "interpret_notes", failed_interpreter)
+    resp = client.post("/optimize-energy", json=case["input"])
+
+    assert resp.status_code == 500
+    assert resp.json() == {
+        "detail": "The optimization service could not complete the request."
+    }

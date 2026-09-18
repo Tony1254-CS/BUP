@@ -76,11 +76,14 @@ def test_paraphrase_interpretation(pcase):
 
     # Unset SKIP_LLM if it was set by another test
     old = os.environ.pop("SKIP_LLM", None)
+    old_test_mode = os.environ.pop("GRIDWISE_TEST_MODE", None)
     try:
         results = asyncio.run(interpret_notes([note], battery))
     finally:
         if old is not None:
             os.environ["SKIP_LLM"] = old
+        if old_test_mode is not None:
+            os.environ["GRIDWISE_TEST_MODE"] = old_test_mode
 
     assert len(results) == 1
     r = results[0]

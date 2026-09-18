@@ -4,8 +4,8 @@ LLM-based operator-note interpreter.
 Architecture:
   - One async Gemini call PER operator note — never batched.
   - Each call has retry with exponential backoff for 429/503 errors.
-  - If a single call ultimately fails, that note falls back to no_op.
-  - SKIP_LLM=true → every note becomes no_op (for optimizer-only testing).
+  - If a single call ultimately fails, the request fails instead of inventing no_op.
+  - SKIP_LLM=true is available only with GRIDWISE_TEST_MODE=true.
 """
 from __future__ import annotations
 
@@ -16,14 +16,17 @@ import os
 import re
 from typing import Any
 
+from dotenv import load_dotenv
+
 from app.guardrails import DirectiveValidationError, validate_directive
 from app.schemas import BatteryInput, DirectiveInterpretation
 
+load_dotenv()
 logger = logging.getLogger(__name__)
 
-PER_CALL_TIMEOUT = 60.0  # seconds total per note (including retries)
-MAX_RETRIES = 3
-BASE_DELAY = 5.0  # seconds between retries
+PER_CALL_TIMEOUT = 20.0  # seconds total per note (including retries)
+MAX_RETRIES = 2
+BASE_DELAY = 1.0  # seconds between retries
 
 SYSTEM_PROMPT = """\
 You are a campus energy scheduling assistant.  You will receive ONE
@@ -36,7 +39,7 @@ RULES
      no_discharge_window, max_grid_window, no_op
   2  Time windows are START-INCLUSIVE, END-EXCLUSIVE.
      "from 1 PM to 3 PM" -> hours [13, 14].
-     "overnight from 10 PM to 6 AM" -> hours [22, 23, 0, 1, 2, 3, 4, 5].
+     "overnight from 10 PM to 6 AM" -> hours [0, 1, 2, 3, 4, 5, 22, 23].
   3  "Reduce solar by 80%" -> factor = 0.20 (remaining fraction, not the
      percentage removed).
      "Reduce solar by X%" -> factor = (100-X)/100.
@@ -46,8 +49,8 @@ RULES
   5  Chatty, irrelevant, or ambiguous notes -> no_op with applies=false.
   6  Do NOT invent constraints not present in the note.
   7  hours must be a sorted list of integers in ascending order, each 0..23.
-     For overnight windows that wrap around midnight, list the hours in
-     chronological order starting from the PM hours.
+     For overnight windows that wrap around midnight, return the hours in
+     ascending numeric order.
 
 OUTPUT — return ONLY a JSON object:
 {
@@ -101,7 +104,7 @@ async def _call_gemini_with_retry(
     for attempt in range(MAX_RETRIES + 1):
         try:
             response = await client.aio.models.generate_content(
-                model="gemini-3.6-flash",
+                model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
                 contents=user_prompt,
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,
@@ -141,32 +144,37 @@ async def _interpret_single(
 ) -> dict[str, Any]:
     """
     Interpret one note with timeout + retry + guardrail validation.
-    On ANY final failure -> no_op for this note only.
+    On any final failure, raise a controlled error for the request.
     """
     try:
         raw = await asyncio.wait_for(
             _call_gemini_with_retry(note, note_index, battery),
             timeout=PER_CALL_TIMEOUT,
         )
+        returned_index = raw.get("note_index")
+        if returned_index is not None and returned_index != note_index:
+            raise DirectiveValidationError(
+                f"LLM returned note_index {returned_index!r} for note {note_index}"
+            )
         raw["note_index"] = note_index
         validate_directive(raw, battery)
         return raw
 
-    except asyncio.TimeoutError:
+    except asyncio.TimeoutError as exc:
         logger.warning("Note %d: Timed out after %.0fs", note_index, PER_CALL_TIMEOUT)
-        return _make_no_op(note_index, "LLM call timed out; defaulted to no_op.")
+        raise RuntimeError("LLM interpretation timed out") from exc
 
     except (json.JSONDecodeError, ValueError) as exc:
-        logger.warning("Note %d: Parse error: %s", note_index, exc)
-        return _make_no_op(note_index, f"Parse error: {exc}")
+        logger.warning("Note %d: Parse error (%s)", note_index, type(exc).__name__)
+        raise RuntimeError("LLM interpretation response was invalid") from exc
 
     except DirectiveValidationError as exc:
         logger.warning("Note %d: Guardrail rejection: %s", note_index, exc)
-        return _make_no_op(note_index, f"Guardrail rejection: {exc}")
+        raise RuntimeError("LLM interpretation failed deterministic guardrails") from exc
 
     except Exception as exc:
-        logger.warning("Note %d: Failed after retries: %s", note_index, exc)
-        return _make_no_op(note_index, f"Error: {exc}")
+        logger.warning("Note %d: Failed after retries (%s)", note_index, type(exc).__name__)
+        raise RuntimeError("LLM interpretation failed") from exc
 
 
 async def interpret_notes(
@@ -175,16 +183,21 @@ async def interpret_notes(
     """
     Interpret all operator notes and return validated directives.
 
-    - SKIP_LLM=true -> all notes become no_op (for optimizer testing).
+    - SKIP_LLM=true with GRIDWISE_TEST_MODE=true -> all notes become no_op.
     - Otherwise: one async Gemini call per note with staggered starts
       to avoid rate limit bursts.
     """
     skip = os.getenv("SKIP_LLM", "").strip().lower() in ("true", "1", "yes")
 
-    if skip or not os.getenv("GEMINI_API_KEY", ""):
+    if skip and os.getenv("GRIDWISE_TEST_MODE", "").strip().lower() not in ("true", "1", "yes"):
+        raise RuntimeError("SKIP_LLM requires GRIDWISE_TEST_MODE=true")
+
+    if skip:
         logger.info("LLM skipped (SKIP_LLM=%s, key=%s)",
                      os.getenv("SKIP_LLM", ""), "set" if os.getenv("GEMINI_API_KEY") else "unset")
         raw_list = [_make_no_op(i, "LLM skipped.") for i in range(len(notes))]
+    elif not os.getenv("GEMINI_API_KEY", "").strip():
+        raise RuntimeError("GEMINI_API_KEY is required when SKIP_LLM is not enabled")
     else:
         # Stagger calls by 1s to reduce rate-limit pressure
         results = []
@@ -194,4 +207,12 @@ async def interpret_notes(
             results.append(_interpret_single(note, i, battery))
         raw_list = await asyncio.gather(*results)
 
-    return [DirectiveInterpretation(**d) for d in raw_list]
+    if len(raw_list) != len(notes):
+        raise DirectiveValidationError("LLM must return exactly one interpretation per note")
+
+    expected_indices = set(range(len(notes)))
+    actual_indices = [item.get("note_index") for item in raw_list]
+    if set(actual_indices) != expected_indices or len(actual_indices) != len(set(actual_indices)):
+        raise DirectiveValidationError("LLM returned invalid or duplicate note_index values")
+
+    return [DirectiveInterpretation(**d) for d in sorted(raw_list, key=lambda item: item["note_index"])]

@@ -11,8 +11,8 @@ We discarded the initial "hackathon-grade" prototype (which relied on LP relaxat
 **Key Accomplishments:**
 1. **Mathematical Rigor**: Upgraded the optimizer from continuous Linear Programming (LP) to Mixed-Integer Linear Programming (MILP) with binary constraints.
 2. **Failure Isolation**: Redesigned the LLM integration so that each operator note is processed asynchronously and independently.
-3. **Strict API Contract**: Enforced 100% adherence to the official problem statement via strict Pydantic schemas and pure-function guardrails.
-4. **Comprehensive Validation**: Built an 87-test suite that proves zero mathematical violations and handles real-world Gemini API rate limits (with retry logic).
+3. **Strict API Contract**: Encoded the official problem statement via strict Pydantic schemas and pure-function guardrails.
+4. **Comprehensive Validation**: Maintains a runnable regression suite covering guardrails, API behavior, optimizer constraints, and replay verification.
 
 ---
 
@@ -22,14 +22,14 @@ Every file in the `app/` directory serves a distinct, isolated purpose. Here is 
 
 ### `app/schemas.py` (The API Contract)
 * **What is there:** Strict Pydantic models mapping field-for-field to the official competition specification.
-* **Why it must be there:** The judge's automated grader will blindly drop requests that contain extra fields, missing fields, or incorrect types. By strictly defining the schemas, we guarantee 100% adherence to the API contract. We do not allow silent data mutations here.
+* **Why it must be there:** The judge's automated grader expects exact fields and types. Strict schemas reject malformed requests instead of silently mutating them.
 
 ### `app/guardrails.py` (The Bouncer)
 * **What is there:** Pure validation functions that check parsed LLM outputs against the official rules (e.g., `hours` must be ascending, `factor` between 0 and 1) and raise `DirectiveValidationError` if a rule is broken.
-* **Why it must be there:** LLMs hallucinate. If an LLM returns an invalid time window or a negative grid cap, applying it would mathematically break the optimizer or violate the spec. Guardrails act as a "bouncer," catching hallucinations and forcing that specific note to default to a safe `no_op`. It explicitly *does not* try to "guess" or "repair" bad data, which often causes worse hidden bugs.
+* **Why it must be there:** LLMs hallucinate. If an LLM returns an invalid time window or a negative grid cap, applying it would mathematically break the optimizer or violate the spec. Guardrails act as a "bouncer," rejecting the request rather than misclassifying an unknown note as `no_op`.
 
 ### `app/llm_interpreter.py` (The Translator)
-* **What is there:** Manages communication with the Gemini 3.6 Flash model. Processes operator notes asynchronously (`asyncio.gather`), isolating one note per LLM call. Includes a 60-second timeout, exponential backoff for rate limits (429/503 errors), and a `SKIP_LLM=true` test flag.
+* **What is there:** Manages communication with a configurable Google Gemini model. Processes operator notes asynchronously (`asyncio.gather`), isolating one note per LLM call. Includes a bounded timeout, retry handling for rate limits (429/503 errors), and a `SKIP_LLM=true` test-only flag.
 * **Why it must be there:** 
   * **One Call Per Note:** In V1, we batched all notes into one prompt. If the LLM misunderstood *one* note, the entire response was corrupted. By isolating them, a failure on Note 2 does not affect Note 1.
   * **Retry Logic:** The free-tier Gemini API drops requests when rate limits are hit. The retry mechanism ensures we survive these spikes during judging without crashing the application.
@@ -44,7 +44,7 @@ Every file in the `app/` directory serves a distinct, isolated purpose. Here is 
 
 ### `tests/` (The Proving Ground)
 * **What is there:** 87 tests including unit tests for guardrails, E2E tests for the API, and strict mathematical validations for the optimizer (ensuring energy balance, battery bounds, and end-of-day neutrality). It also includes a natural language paraphrase test suite.
-* **Why it must be there:** To win a hackathon, you must test against the rubric before the judges do. The `test_optimizer.py` proves our math is perfect across all 10 sample cases (0.00 BDT difference). The `SKIP_LLM=true` flag allows us to run these 87 tests in under 3 seconds without waiting for network calls, enabling rapid iteration.
+* **Why it must be there:** The tests exercise the public sample cases, replay constraints, schema validation, and safe deterministic test mode without claiming that local tests replace hidden evaluation.
 
 ---
 
@@ -52,8 +52,8 @@ Every file in the `app/` directory serves a distinct, isolated purpose. Here is 
 
 If a brutal judge looks at this codebase, they will see a system built for resilience:
 
-1. **No Silent Failures:** If the LLM goes crazy, the system gracefully defaults to `no_op` rather than crashing or outputting impossible math.
-2. **Mathematically Bulletproof:** The MILP implementation guarantees zero physical constraint violations.
+1. **Controlled LLM Failures:** Invalid individual LLM outputs reject the request without applying impossible math or inventing `no_op`.
+2. **Constraint-Based Scheduling:** The MILP implementation encodes physical and directive constraints before serialization.
 3. **Production-Ready Scaling:** The async, retry-backed LLM calls mean this API can handle the judge's automated load testing without dropping connections.
 4. **Zero Assumptions:** Every line of code maps directly to a rule explicitly written in the problem statement.
 
