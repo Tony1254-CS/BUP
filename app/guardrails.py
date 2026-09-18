@@ -1,159 +1,158 @@
-import math
-from typing import List, Dict, Any, Optional
-from app.schemas import DirectiveInterpretation, BatteryConfig, DirectiveType
+"""
+Pure-function guardrails for directive validation.
 
-VALID_DIRECTIVE_TYPES = {
-    "solar_reduction",
-    "minimum_battery_reserve",
-    "no_charge_window",
-    "no_discharge_window",
-    "max_grid_window",
-    "no_op"
-}
+Every rule traces to an explicit line in the spec's interpretation_rules
+or constraint_reminders.  NO I/O, NO imports beyond stdlib + schemas.
 
-def sanitize_hours(raw_hours: Any) -> List[int]:
-    """Ensures hours are unique integers in [0..23], sorted ascending."""
-    if not isinstance(raw_hours, (list, tuple)):
-        return []
-    valid_hours = set()
-    for h in raw_hours:
-        try:
-            h_int = int(round(float(h)))
-            if 0 <= h_int <= 23:
-                valid_hours.add(h_int)
-        except (ValueError, TypeError):
-            continue
-    return sorted(list(valid_hours))
+Raises ``DirectiveValidationError`` on any violation so the caller can
+catch and fall back to no_op for that single note.
+"""
+from __future__ import annotations
 
-def validate_and_sanitize_directive(
-    raw_directive: Dict[str, Any],
-    expected_index: int,
-    battery: BatteryConfig
-) -> DirectiveInterpretation:
+from typing import Any
+
+from app.schemas import BatteryInput
+
+VALID_DIRECTIVE_TYPES = frozenset(
+    {
+        "solar_reduction",
+        "minimum_battery_reserve",
+        "no_charge_window",
+        "no_discharge_window",
+        "max_grid_window",
+        "no_op",
+    }
+)
+
+
+class DirectiveValidationError(Exception):
+    """Raised when a raw directive dict violates spec rules."""
+
+
+def validate_directive(raw: dict[str, Any], battery: BatteryInput) -> None:
     """
-    Validates and sanitizes a single directive interpretation against
-    Section 08 LLM Interpretation Guardrails.
+    Validate a single raw directive dict in-place.
+    Raises ``DirectiveValidationError`` on any violation.
+    Does NOT mutate or repair — caller must catch and fall back.
+
+    Checked rules (spec references):
+      - directive_type must be one of the 6 allowed enum values
+      - For no_op: applies must be False AND structured_adjustment must be None/null
+      - For every non-no_op: applies must be True
+      - structured_adjustment must contain the required keys for the type
+      - hours must be a non-empty list of unique ints 0..23 in ascending order
+      - factor must be a float in [0, 1] for solar_reduction
+      - minimum_energy_kwh must be > 0 for minimum_battery_reserve
+      - max_grid_kwh must be >= 0 for max_grid_window
     """
-    directive_type: str = str(raw_directive.get("directive_type", "no_op")).strip().lower()
-    if directive_type not in VALID_DIRECTIVE_TYPES:
-        directive_type = "no_op"
-
-    raw_applies = raw_directive.get("applies", False)
-    explanation = str(raw_directive.get("explanation", "")).strip() or "Standard directive processing."
-    raw_adjustment = raw_directive.get("structured_adjustment")
-
-    if directive_type == "no_op" or not raw_applies:
-        return DirectiveInterpretation(
-            note_index=expected_index,
-            applies=False,
-            directive_type="no_op",
-            structured_adjustment=None,
-            explanation=explanation or "This note does not affect today's 24-hour energy schedule."
+    # ── directive_type ────────────────────────────────────────────────────
+    dtype = raw.get("directive_type")
+    if dtype not in VALID_DIRECTIVE_TYPES:
+        raise DirectiveValidationError(
+            f"Unknown directive_type: {dtype!r}. "
+            f"Must be one of {sorted(VALID_DIRECTIVE_TYPES)}"
         )
 
-    # For all other directives: applies must be True and adjustment must match required schema
-    sanitized_adjustment: Dict[str, Any] = {}
-    if not isinstance(raw_adjustment, dict):
-        # Fallback to no_op if adjustment missing for an active directive
-        return DirectiveInterpretation(
-            note_index=expected_index,
-            applies=False,
-            directive_type="no_op",
-            structured_adjustment=None,
-            explanation="Malformed adjustment data; treated as no_op safely."
+    applies = raw.get("applies")
+    adj = raw.get("structured_adjustment")
+
+    # ── no_op rules ───────────────────────────────────────────────────────
+    if dtype == "no_op":
+        if applies is not False:
+            raise DirectiveValidationError(
+                "no_op directive must have applies=false"
+            )
+        if adj is not None:
+            raise DirectiveValidationError(
+                "no_op directive must have structured_adjustment=null"
+            )
+        return  # valid no_op
+
+    # ── non-no_op must have applies=True ──────────────────────────────────
+    if applies is not True:
+        raise DirectiveValidationError(
+            f"{dtype} directive must have applies=true, got {applies!r}"
         )
 
-    hours = sanitize_hours(raw_adjustment.get("hours", []))
-    if not hours:
-        # Without hours, directive cannot be applied
-        return DirectiveInterpretation(
-            note_index=expected_index,
-            applies=False,
-            directive_type="no_op",
-            structured_adjustment=None,
-            explanation="No valid hours specified; treated as no_op safely."
+    # ── structured_adjustment must be a dict ──────────────────────────────
+    if not isinstance(adj, dict):
+        raise DirectiveValidationError(
+            f"{dtype} requires a dict structured_adjustment, got {type(adj).__name__}"
         )
 
-    sanitized_adjustment["hours"] = hours
+    # ── hours validation (all non-no_op types need hours) ─────────────────
+    hours = adj.get("hours")
+    _validate_hours(hours, dtype)
 
-    if directive_type == "solar_reduction":
-        factor = raw_adjustment.get("factor")
-        try:
-            factor_val = float(factor)
-            if math.isnan(factor_val) or math.isinf(factor_val):
-                factor_val = 1.0
-            factor_val = max(0.0, min(1.0, factor_val))
-        except (ValueError, TypeError):
-            factor_val = 1.0
-        sanitized_adjustment["factor"] = factor_val
+    # ── type-specific fields ──────────────────────────────────────────────
+    if dtype == "solar_reduction":
+        factor = adj.get("factor")
+        if factor is None:
+            raise DirectiveValidationError("solar_reduction requires 'factor'")
+        if not isinstance(factor, (int, float)):
+            raise DirectiveValidationError(
+                f"solar_reduction factor must be numeric, got {type(factor).__name__}"
+            )
+        if not (0.0 <= float(factor) <= 1.0):
+            raise DirectiveValidationError(
+                f"solar_reduction factor must be in [0, 1], got {factor}"
+            )
 
-    elif directive_type == "minimum_battery_reserve":
-        min_reserve = raw_adjustment.get("minimum_energy_kwh")
-        try:
-            res_val = float(min_reserve)
-            if math.isnan(res_val) or math.isinf(res_val):
-                res_val = battery.minimum_energy_kwh
-            res_val = max(0.0, min(battery.capacity_kwh, res_val))
-        except (ValueError, TypeError):
-            res_val = battery.minimum_energy_kwh
-        sanitized_adjustment["minimum_energy_kwh"] = res_val
+    elif dtype == "minimum_battery_reserve":
+        mek = adj.get("minimum_energy_kwh")
+        if mek is None:
+            raise DirectiveValidationError(
+                "minimum_battery_reserve requires 'minimum_energy_kwh'"
+            )
+        if not isinstance(mek, (int, float)):
+            raise DirectiveValidationError(
+                "minimum_energy_kwh must be numeric"
+            )
+        if float(mek) < 0:
+            raise DirectiveValidationError(
+                f"minimum_energy_kwh must be >= 0, got {mek}"
+            )
 
-    elif directive_type == "max_grid_window":
-        max_grid = raw_adjustment.get("max_grid_kwh")
-        try:
-            grid_val = float(max_grid)
-            if math.isnan(grid_val) or math.isinf(grid_val):
-                grid_val = 1e6
-            grid_val = max(0.0, grid_val)
-        except (ValueError, TypeError):
-            grid_val = 1e6
-        sanitized_adjustment["max_grid_kwh"] = grid_val
+    elif dtype == "max_grid_window":
+        mgk = adj.get("max_grid_kwh")
+        if mgk is None:
+            raise DirectiveValidationError(
+                "max_grid_window requires 'max_grid_kwh'"
+            )
+        if not isinstance(mgk, (int, float)):
+            raise DirectiveValidationError("max_grid_kwh must be numeric")
+        if float(mgk) < 0:
+            raise DirectiveValidationError(
+                f"max_grid_kwh must be >= 0, got {mgk}"
+            )
 
-    elif directive_type in ("no_charge_window", "no_discharge_window"):
-        # only hours required
+    elif dtype in ("no_charge_window", "no_discharge_window"):
+        # Only hours required — already validated above
         pass
 
-    return DirectiveInterpretation(
-        note_index=expected_index,
-        applies=True,
-        directive_type=directive_type,  # type: ignore
-        structured_adjustment=sanitized_adjustment,
-        explanation=explanation
-    )
 
-def guardrail_directives(
-    raw_directives: List[Dict[str, Any]],
-    num_notes: int,
-    battery: BatteryConfig
-) -> List[DirectiveInterpretation]:
-    """
-    Enforces that exactly num_notes interpretations exist, sorted by note_index 0..N-1,
-    with no missing or duplicate mappings.
-    """
-    # Map by note_index if available
-    indexed: Dict[int, Dict[str, Any]] = {}
-    for item in raw_directives:
-        if isinstance(item, dict):
-            idx = item.get("note_index")
-            if idx is not None and isinstance(idx, int) and 0 <= idx < num_notes:
-                indexed[idx] = item
+def _validate_hours(hours: Any, dtype: str) -> None:
+    """Validate the hours array per spec interpretation_rules."""
+    if not isinstance(hours, list):
+        raise DirectiveValidationError(
+            f"{dtype}: 'hours' must be a list, got {type(hours).__name__}"
+        )
+    if len(hours) == 0:
+        raise DirectiveValidationError(f"{dtype}: 'hours' must be non-empty")
 
-    results: List[DirectiveInterpretation] = []
-    for i in range(num_notes):
-        raw_item = indexed.get(i)
-        if raw_item is None:
-            # Check if positional item exists
-            if i < len(raw_directives) and isinstance(raw_directives[i], dict):
-                raw_item = raw_directives[i]
-            else:
-                raw_item = {
-                    "note_index": i,
-                    "applies": False,
-                    "directive_type": "no_op",
-                    "structured_adjustment": None,
-                    "explanation": "No directive extracted; defaulted to no_op."
-                }
-        sanitized = validate_and_sanitize_directive(raw_item, i, battery)
-        results.append(sanitized)
-
-    return results
+    prev = -1
+    for i, h in enumerate(hours):
+        if not isinstance(h, int):
+            raise DirectiveValidationError(
+                f"{dtype}: hours[{i}] must be int, got {type(h).__name__} ({h!r})"
+            )
+        if h < 0 or h > 23:
+            raise DirectiveValidationError(
+                f"{dtype}: hours[{i}]={h} out of range [0, 23]"
+            )
+        if h <= prev:
+            raise DirectiveValidationError(
+                f"{dtype}: hours must be unique and ascending; "
+                f"hours[{i}]={h} is not > previous {prev}"
+            )
+        prev = h

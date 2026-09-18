@@ -1,1 +1,1 @@
-# GridWise Application Package
+# app package
